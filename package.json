@@ -1,0 +1,20 @@
+{
+  "name": "lemonsqueezy-to-chartmogul",
+  "version": "1.0.0",
+  "description": "Script to export data from LemonSqueezy and import it into ChartMogul",
+  "main": "lemonsqueezy-to-chartmogul.ts",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node --loader ts-node/esm lemonsqueezy-to-chartmogul.ts"
+  },
+  "dependencies": {
+    "@lemonsqueezy/lemonsqueezy.js": "^1.0.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.0.0"
+  }
+}
