@@ -51,7 +51,7 @@ npm run start
 
 At the end of the process all the customers, subscriptions, invoices, will be created.
 
-To update the data, delete all the content of the ChartMogul source, and run the script again.
+To update the data, run the script again.
 
 ### Roadmap
 

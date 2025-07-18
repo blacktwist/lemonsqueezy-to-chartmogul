@@ -1,8 +1,11 @@
+import "varlock/auto-load";
+import { ENV } from "varlock/env";
 import {
   chartMogulApi,
   getAllChartMogulCustomers,
   getAllChartMogulPlans,
-} from "./libs/chartMogul";
+  deleteAllChartMogulData,
+} from "./libs/chartMogul.js";
 import {
   getAllLemonSqueezyCustomers,
   getAllLemonSqueezyDiscountRedemptions,
@@ -10,10 +13,16 @@ import {
   getAllLemonSqueezyVariants,
   getAllLemonSqueezySubscriptions,
   lemonSqueezyClient,
-} from "./libs/lemonSqueezy";
+} from "./libs/lemonSqueezy.js";
+
+const CHARTMOGUL_DATA_SOURCE_UUID = ENV.CHARTMOGUL_DATA_SOURCE_UUID;
 
 async function importData() {
   try {
+    // Delete all existing data from ChartMogul first
+    console.log("Deleting all existing data from ChartMogul...");
+    await deleteAllChartMogulData();
+
     // Get all existing customers and plans from ChartMogul first
     let existingChartMogulCustomers = await getAllChartMogulCustomers();
     let existingChartMogulPlans = await getAllChartMogulPlans();
@@ -64,7 +73,7 @@ async function importData() {
               country: customer.attributes.country,
               state: customer.attributes.region,
               city: customer.attributes.city,
-              data_source_uuid: process.env.CHARTMOGUL_DATA_SOURCE_UUID,
+              data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
               email: customer.attributes.email,
               primary_contact: {
                 first_name: customer.attributes.name?.split(" ")[0] || "",
@@ -91,7 +100,7 @@ async function importData() {
             });
             await chartMogulApi.post("/customers", {
               external_id: customer.id.toString(),
-              data_source_uuid: process.env.CHARTMOGUL_DATA_SOURCE_UUID,
+              data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
               company: customer.attributes.name || customer.attributes.email,
               country: customer.attributes.country,
               state: customer.attributes.region,
@@ -158,7 +167,7 @@ async function importData() {
               interval_unit: isAnnual ? "year" : "month",
               interval_count: isAnnual ? 1 : 1,
               external_id: product.id.toString(),
-              data_source_uuid: process.env.CHARTMOGUL_DATA_SOURCE_UUID,
+              data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
             });
             console.log(
               `Created plan from product: ${product.attributes.name}`
@@ -190,6 +199,7 @@ async function importData() {
                 variant.attributes.is_subscription &&
                 variant.attributes.interval
               ) {
+                // @ts-ignore
                 interval_unit = variant.attributes.interval;
                 interval_count = variant.attributes.interval_count || 1;
               } else {
@@ -213,7 +223,7 @@ async function importData() {
                 interval_unit: interval_unit,
                 interval_count: interval_count,
                 external_id: `${product.id}-${variant.id}`,
-                data_source_uuid: process.env.CHARTMOGUL_DATA_SOURCE_UUID,
+                data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
               });
               console.log(
                 `Created plan from variant: ${product.attributes.name} - ${variant.attributes.name}`
@@ -289,7 +299,7 @@ async function importData() {
                 subscription_event: {
                   external_id: `${subscription.id}-start`,
                   customer_external_id: customer.external_id,
-                  data_source_uuid: process.env.CHARTMOGUL_DATA_SOURCE_UUID,
+                  data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
                   event_type: "subscription_start_scheduled",
                   event_date: subscription.attributes.created_at,
                   effective_date: subscription.attributes.created_at,
@@ -316,7 +326,7 @@ async function importData() {
                 subscription_event: {
                   external_id: `${subscription.id}-cancelled`,
                   customer_external_id: customer.external_id,
-                  data_source_uuid: process.env.CHARTMOGUL_DATA_SOURCE_UUID,
+                  data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
                   event_type: "subscription_cancelled",
                   event_date: subscription.attributes.updated_at,
                   effective_date: subscription.attributes.updated_at,
@@ -344,7 +354,7 @@ async function importData() {
                 subscription_event: {
                   external_id: `${subscription.id}-expired`,
                   customer_external_id: customer.external_id,
-                  data_source_uuid: process.env.CHARTMOGUL_DATA_SOURCE_UUID,
+                  data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
                   event_type: "subscription_cancelled",
                   event_date:
                     subscription.attributes.ends_at ||
@@ -410,6 +420,8 @@ async function importData() {
           continue;
         }
 
+        console.log(">>> customer", subscription.attributes.user_email);
+
         // Get the order details to get pricing information
         const order = await lemonSqueezyClient.getOrder({
           id: subscription.attributes.order_id,
@@ -449,6 +461,8 @@ async function importData() {
             const originalAmount =
               order.data.attributes.subtotal - discountAmount;
 
+            const taxAmount = order.data.attributes.tax || 0;
+
             lineItems.push({
               type: "subscription",
               subscription_external_id: subscription.id.toString(),
@@ -457,7 +471,7 @@ async function importData() {
               service_period_end:
                 subscription.attributes.ends_at ||
                 subscription.attributes.renews_at,
-              amount_in_cents: originalAmount, // ✅ Original price before discount
+              amount_in_cents: originalAmount + taxAmount, // ✅ Original price before discount
               quantity: 1,
               event_order: 1,
               discount_description:
@@ -465,7 +479,7 @@ async function importData() {
               discount_code:
                 discountRedemption?.attributes?.discount_code || undefined,
               discount_amount_in_cents: discountAmount, // ✅ Discount amount
-              tax_amount_in_cents: order.data.attributes.tax,
+              tax_amount_in_cents: taxAmount,
               transaction_fees_in_cents:
                 subscription.attributes.transaction_fees,
               transaction_fees_currency: order.data.attributes.currency,
@@ -491,6 +505,8 @@ async function importData() {
         }
 
         // Import invoice to ChartMogul
+
+        console.log(">>> lineItems", lineItems);
         try {
           await chartMogulApi.post(
             `/import/customers/${customer.uuid}/invoices`,
@@ -502,7 +518,7 @@ async function importData() {
                   currency: order.data.attributes.currency,
                   due_date: subscription.attributes.created_at,
                   customer_external_id: customer.external_id,
-                  data_source_uuid: process.env.CHARTMOGUL_DATA_SOURCE_UUID,
+                  data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
                   line_items: lineItems,
                   transactions: transactions,
                 },

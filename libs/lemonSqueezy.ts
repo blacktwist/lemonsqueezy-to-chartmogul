@@ -1,11 +1,10 @@
+import "varlock/auto-load";
+import { ENV } from "varlock/env";
 import { LemonSqueezy } from "@lemonsqueezy/lemonsqueezy.js";
-import dotenv from "dotenv";
 
-dotenv.config();
+const LEMONSQUEEZY_API_KEY = ENV.LEMONSQUEEZY_API_KEY;
 
-export const lemonSqueezyClient = new LemonSqueezy(
-  process.env.LEMONSQUEEZY_API_KEY || ""
-);
+export const lemonSqueezyClient = new LemonSqueezy(LEMONSQUEEZY_API_KEY);
 
 type LemonSqueezyCustomersResponse = {
   meta: {

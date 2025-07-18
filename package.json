@@ -5,16 +5,22 @@
   "main": "lemonsqueezy-to-chartmogul.ts",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
-    "start": "node --loader ts-node/esm lemonsqueezy-to-chartmogul.ts"
+    "dev": "tsx lemonsqueezy-to-chartmogul.ts",
+    "build": "tsc",
+    "start": "varlock load && npm run build && node dist/lemonsqueezy-to-chartmogul.js"
   },
   "dependencies": {
     "@lemonsqueezy/lemonsqueezy.js": "^1.0.0",
     "axios": "^1.6.0",
     "dotenv": "^16.3.1",
     "ts-node": "^10.9.1",
-    "typescript": "^5.0.0"
+    "typescript": "^5.0.0",
+    "varlock": "^0.0.4"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.0"
   }
 }
