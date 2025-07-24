@@ -550,4 +550,13 @@ async function importData() {
   }
 }
 
-importData();
+(async () => {
+  try {
+    await importData();
+    console.log("All done.");
+    process.exit(0);
+  } catch (err) {
+    console.error("Error:", err);
+    process.exit(1);
+  }
+})();
