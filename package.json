@@ -10,7 +10,8 @@
   "scripts": {
     "dev": "tsx lemonsqueezy-to-chartmogul.ts",
     "build": "tsc",
-    "start": "varlock load && npm run build && node dist/lemonsqueezy-to-chartmogul.js"
+    "start": "varlock load && npm run build && node dist/lemonsqueezy-to-chartmogul.js",
+    "cron": "varlock load && npm run build && pm2 start dist/lemonsqueezy-to-chartmogul.js --name sync-chartmogul --cron \"0 5 * * *\" --no-autorestart --time"
   },
   "dependencies": {
     "@lemonsqueezy/lemonsqueezy.js": "^1.0.0",
