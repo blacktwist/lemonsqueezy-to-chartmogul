@@ -371,3 +371,53 @@ export const getAllLemonSqueezyDiscountRedemptions = async () => {
   );
   return discountRedemptions;
 };
+
+export const getAllLemonSqueezySubscriptionInvoices = async () => {
+  let invoices: any[] = [];
+  let page = 1;
+
+  console.log("Fetching all subscription invoices from LemonSqueezy...");
+
+  while (true) {
+    try {
+      // @ts-ignore
+      const response = await lemonSqueezyClient.getSubscriptionInvoices({
+        page: page,
+      });
+
+      if (response.data && response.data.length > 0) {
+        invoices = [...invoices, ...response.data];
+        console.log(
+          `Fetched ${response.data.length} subscription invoices. Total so far: ${invoices.length}`
+        );
+      }
+
+      // Check if we've reached the last page
+      // @ts-ignore
+      if (response.meta && response.meta.page) {
+        // @ts-ignore
+        if (response.meta.page.currentPage === response.meta.page.lastPage) {
+          break;
+        }
+      } else if (!response.data || response.data.length === 0) {
+        break;
+      }
+
+      page++;
+
+      // Add a small delay to avoid rate limiting
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    } catch (error: any) {
+      console.error(
+        "Error fetching subscription invoices from LemonSqueezy:",
+        error?.response?.data || error
+      );
+      break;
+    }
+  }
+
+  console.log(
+    `Total subscription invoices fetched from LemonSqueezy: ${invoices.length}`
+  );
+  return invoices;
+};

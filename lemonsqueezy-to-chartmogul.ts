@@ -12,6 +12,7 @@ import {
   getAllLemonSqueezyProducts,
   getAllLemonSqueezyVariants,
   getAllLemonSqueezySubscriptions,
+  getAllLemonSqueezySubscriptionInvoices,
   lemonSqueezyClient,
 } from "./libs/lemonSqueezy.js";
 
@@ -395,53 +396,46 @@ async function importData() {
 
     // 4. Export and import invoices
     console.log("Exporting and importing invoices...");
-    console.log(`Found ${subscriptions.length} subscriptions in LemonSqueezy`);
+    const allSubscriptionInvoices = await getAllLemonSqueezySubscriptionInvoices();
+    console.log(`Found ${allSubscriptionInvoices.length} subscription invoices in LemonSqueezy`);
 
-    for (const subscription of subscriptions) {
+    // Group invoices by subscription
+    const invoicesBySubscription = new Map<string, any[]>();
+    for (const invoice of allSubscriptionInvoices) {
+      const subscriptionId = invoice.attributes.subscription_id?.toString();
+      if (!subscriptionId) continue;
+
+      if (!invoicesBySubscription.has(subscriptionId)) {
+        invoicesBySubscription.set(subscriptionId, []);
+      }
+      invoicesBySubscription.get(subscriptionId)!.push(invoice);
+    }
+
+    // Process each subscription's invoices
+    for (const [subscriptionId, invoices] of invoicesBySubscription) {
       try {
-        console.log("Processing subscription:", {
-          id: subscription.id,
-          customer_email: subscription.attributes.user_email,
-          status: subscription.attributes.status,
-          product_id: subscription.attributes.product_id,
-          order_id: subscription.attributes.order_id,
-        });
+        // Find the subscription
+        const subscription = subscriptions.find(
+          (s) => s.id === subscriptionId
+        );
+
+        if (!subscription) {
+          console.log(`Subscription not found for ID: ${subscriptionId}`);
+          continue;
+        }
+
+        const customerEmail = subscription.attributes.user_email;
+        console.log(`Processing ${invoices.length} invoices for subscription ${subscriptionId} (${customerEmail})`);
 
         // Find the customer in ChartMogul
         const customer = existingChartMogulCustomers.find(
-          (c) => c.email === subscription.attributes.user_email
+          (c) => c.email === customerEmail
         );
 
         if (!customer) {
-          console.error(
-            "Customer not found on ChartMogul:",
-            subscription.attributes.user_email
-          );
+          console.error("Customer not found on ChartMogul:", customerEmail);
           continue;
         }
-
-        console.log(">>> customer", subscription.attributes.user_email);
-
-        // Get the order details to get pricing information
-        const order = await lemonSqueezyClient.getOrder({
-          id: subscription.attributes.order_id,
-        });
-
-        if (!order) {
-          console.error(
-            "Order not found on Lemon Squeezy:",
-            subscription.attributes.order_id
-          );
-          continue;
-        }
-
-        // get the discount redemption for this order
-        const discountRedemption = allLemonSqueezyDiscountRedemptions.find(
-          (d) => d.attributes.order_id === subscription.attributes.order_id
-        );
-
-        // Prepare line items for ChartMogul
-        const lineItems = [];
 
         // Get plan UUID from ChartMogul
         let planExternalId = subscription.attributes.variant_id
@@ -449,101 +443,133 @@ async function importData() {
           : subscription.attributes.product_id.toString();
 
         // Search for the plan in ChartMogul
-        try {
-          // Use the existing plans array instead of API call
-          const plan = existingChartMogulPlans.find(
-            (p) => p.external_id === planExternalId
-          );
+        const plan = existingChartMogulPlans.find(
+          (p) => p.external_id === planExternalId
+        );
 
-          if (plan) {
-            // Calculate original price before discount
+        if (!plan) {
+          console.log(`Plan not found for external_id: ${planExternalId}`);
+          continue;
+        }
+
+        // Sort invoices by billing date
+        invoices.sort((a, b) =>
+          new Date(a.attributes.billing_at || a.attributes.created_at).getTime() -
+          new Date(b.attributes.billing_at || b.attributes.created_at).getTime()
+        );
+
+        // Process each invoice
+        for (const lsInvoice of invoices) {
+          try {
+            console.log("Processing subscription invoice:", {
+              id: lsInvoice.id,
+              billing_at: lsInvoice.attributes.billing_at,
+              subtotal: lsInvoice.attributes.subtotal,
+              total: lsInvoice.attributes.total,
+              status: lsInvoice.attributes.status,
+            });
+
+            // Skip refunded or void invoices
+            if (lsInvoice.attributes.status === "refunded" || lsInvoice.attributes.status === "void") {
+              console.log(`Skipping ${lsInvoice.attributes.status} invoice: ${lsInvoice.id}`);
+              continue;
+            }
+
+            // Get the discount redemption for this invoice (if any)
+            const discountRedemption = allLemonSqueezyDiscountRedemptions.find(
+              (d) => d.attributes.order_id === lsInvoice.attributes.order_id
+            );
+
+            // Prepare line items for ChartMogul
+            const lineItems = [];
+
+            // Calculate amounts
             const discountAmount = discountRedemption?.attributes?.amount || 0;
-            const originalAmount =
-              order.data.attributes.subtotal - discountAmount;
+            const subtotal = lsInvoice.attributes.subtotal || 0;
+            const taxAmount = lsInvoice.attributes.tax || 0;
 
-            const taxAmount = order.data.attributes.tax || 0;
+            // Calculate service period based on billing date and plan interval
+            const billingDate = new Date(lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at);
+            let servicePeriodEnd = new Date(billingDate);
+
+            const plan_interval = plan.interval_unit || "month";
+            const plan_interval_count = plan.interval_count || 1;
+
+            if (plan_interval === "year") {
+              servicePeriodEnd.setFullYear(servicePeriodEnd.getFullYear() + plan_interval_count);
+            } else {
+              servicePeriodEnd.setMonth(servicePeriodEnd.getMonth() + plan_interval_count);
+            }
 
             lineItems.push({
               type: "subscription",
               subscription_external_id: subscription.id.toString(),
               plan_uuid: plan.uuid,
-              service_period_start: subscription.attributes.created_at,
-              service_period_end:
-                subscription.attributes.ends_at ||
-                subscription.attributes.renews_at,
-              amount_in_cents: originalAmount + taxAmount, // ✅ Original price before discount
+              service_period_start: lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at,
+              service_period_end: servicePeriodEnd.toISOString(),
+              amount_in_cents: subtotal + taxAmount,
               quantity: 1,
-              event_order: 1,
               discount_description:
                 discountRedemption?.attributes?.discount_name || undefined,
               discount_code:
                 discountRedemption?.attributes?.discount_code || undefined,
-              discount_amount_in_cents: discountAmount, // ✅ Discount amount
+              discount_amount_in_cents: discountAmount,
               tax_amount_in_cents: taxAmount,
-              transaction_fees_in_cents:
-                subscription.attributes.transaction_fees,
-              transaction_fees_currency: order.data.attributes.currency,
             });
-          } else {
-            console.log(`Plan not found for external_id: ${planExternalId}`);
-          }
-        } catch (planError: any) {
-          console.error(
-            "Error finding plan for subscription:",
-            planError?.response?.data || planError
-          );
-        }
 
-        // Prepare transactions
-        const transactions = [];
-        if (subscription.attributes.status === "active") {
-          transactions.push({
-            date: subscription.attributes.created_at,
-            type: "payment",
-            result: "successful",
-          });
-        }
-
-        // Import invoice to ChartMogul
-
-        console.log(">>> lineItems", lineItems);
-        try {
-          await chartMogulApi.post(
-            `/import/customers/${customer.uuid}/invoices`,
-            {
-              invoices: [
-                {
-                  external_id: "inv-" + subscription.id.toString(),
-                  date: subscription.attributes.created_at,
-                  currency: order.data.attributes.currency,
-                  due_date: subscription.attributes.created_at,
-                  customer_external_id: customer.external_id,
-                  data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
-                  line_items: lineItems,
-                  transactions: transactions,
-                },
-              ],
+            // Prepare transactions
+            const transactions = [];
+            if (lsInvoice.attributes.status === "paid") {
+              transactions.push({
+                date: lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at,
+                type: "payment",
+                result: "successful",
+              });
             }
-          );
-          console.log(`Imported subscription as invoice: ${subscription.id}`);
-        } catch (importError: any) {
-          console.error(
-            "Error importing subscription as invoice:",
-            importError?.response?.data
-              ? JSON.stringify(importError.response.data)
-              : importError
-          );
+
+            // Import invoice to ChartMogul
+            try {
+              await chartMogulApi.post(
+                `/import/customers/${customer.uuid}/invoices`,
+                {
+                  invoices: [
+                    {
+                      external_id: `ls-inv-${lsInvoice.id}`,
+                      date: lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at,
+                      currency: lsInvoice.attributes.currency,
+                      due_date: lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at,
+                      customer_external_id: customer.external_id,
+                      data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
+                      line_items: lineItems,
+                      transactions: transactions,
+                    },
+                  ],
+                }
+              );
+              console.log(`Imported subscription invoice: ${lsInvoice.id}`);
+            } catch (importError: any) {
+              console.error(
+                "Error importing subscription invoice:",
+                importError?.response?.data
+                  ? JSON.stringify(importError.response.data)
+                  : importError
+              );
+            }
+          } catch (error: any) {
+            console.error(
+              "Error processing subscription invoice:",
+              error?.response?.data || error
+            );
+          }
         }
       } catch (error: any) {
         console.error(
-          "Error processing subscription:",
+          "Error processing subscription invoices:",
           error?.response?.data || error
         );
       }
     }
-    console.log(
-      "Subscriptions exported and imported as invoices successfully!"
-    );
+    console.log("Subscription invoices exported and imported successfully!");
     console.log("Data export and import completed successfully!");
   } catch (error) {
     console.error("Error during data export and import:", error);

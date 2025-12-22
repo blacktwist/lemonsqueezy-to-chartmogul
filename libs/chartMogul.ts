@@ -151,25 +151,25 @@ export const deleteAllChartMogulData = async () => {
   console.log("Starting deletion of all ChartMogul data...");
 
   try {
-    // 1. Delete all invoices first (they reference customers and plans)
-    console.log("Deleting all invoices...");
-    const invoices = await getAllChartMogulInvoices();
+    // 1. Delete all customers (this will cascade delete their invoices)
+    console.log("Deleting all customers (including their invoices)...");
+    const customers = await getAllChartMogulCustomers();
 
-    for (const invoice of invoices) {
+    for (const customer of customers) {
       try {
-        await chartMogulApi.delete(`/invoices/${invoice.uuid}`);
-        console.log(`Deleted invoice: ${invoice.uuid}`);
+        await chartMogulApi.delete(`/customers/${customer.uuid}`);
+        console.log(`Deleted customer (and their invoices): ${customer.uuid}`);
         // Add a small delay to avoid rate limiting
         await new Promise((resolve) => setTimeout(resolve, 100));
       } catch (error: any) {
         console.error(
-          `Error deleting invoice ${invoice.uuid}:`,
+          `Error deleting customer ${customer.uuid}:`,
           error?.response?.data || error
         );
       }
     }
 
-    // 2. Delete all plans
+    // 2. Delete all plans (now that invoices are gone via customer deletion)
     console.log("Deleting all plans...");
     const plans = await getAllChartMogulPlans();
 
@@ -182,24 +182,6 @@ export const deleteAllChartMogulData = async () => {
       } catch (error: any) {
         console.error(
           `Error deleting plan ${plan.uuid}:`,
-          error?.response?.data || error
-        );
-      }
-    }
-
-    // 3. Delete all customers
-    console.log("Deleting all customers...");
-    const customers = await getAllChartMogulCustomers();
-
-    for (const customer of customers) {
-      try {
-        await chartMogulApi.delete(`/customers/${customer.uuid}`);
-        console.log(`Deleted customer: ${customer.uuid}`);
-        // Add a small delay to avoid rate limiting
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      } catch (error: any) {
-        console.error(
-          `Error deleting customer ${customer.uuid}:`,
           error?.response?.data || error
         );
       }
