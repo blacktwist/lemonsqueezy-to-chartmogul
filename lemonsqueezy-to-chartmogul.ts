@@ -396,8 +396,11 @@ async function importData() {
 
     // 4. Export and import invoices
     console.log("Exporting and importing invoices...");
-    const allSubscriptionInvoices = await getAllLemonSqueezySubscriptionInvoices();
-    console.log(`Found ${allSubscriptionInvoices.length} subscription invoices in LemonSqueezy`);
+    const allSubscriptionInvoices =
+      await getAllLemonSqueezySubscriptionInvoices();
+    console.log(
+      `Found ${allSubscriptionInvoices.length} subscription invoices in LemonSqueezy`
+    );
 
     // Group invoices by subscription
     const invoicesBySubscription = new Map<string, any[]>();
@@ -415,9 +418,7 @@ async function importData() {
     for (const [subscriptionId, invoices] of invoicesBySubscription) {
       try {
         // Find the subscription
-        const subscription = subscriptions.find(
-          (s) => s.id === subscriptionId
-        );
+        const subscription = subscriptions.find((s) => s.id === subscriptionId);
 
         if (!subscription) {
           console.log(`Subscription not found for ID: ${subscriptionId}`);
@@ -425,7 +426,9 @@ async function importData() {
         }
 
         const customerEmail = subscription.attributes.user_email;
-        console.log(`Processing ${invoices.length} invoices for subscription ${subscriptionId} (${customerEmail})`);
+        console.log(
+          `Processing ${invoices.length} invoices for subscription ${subscriptionId} (${customerEmail})`
+        );
 
         // Find the customer in ChartMogul
         const customer = existingChartMogulCustomers.find(
@@ -453,9 +456,14 @@ async function importData() {
         }
 
         // Sort invoices by billing date
-        invoices.sort((a, b) =>
-          new Date(a.attributes.billing_at || a.attributes.created_at).getTime() -
-          new Date(b.attributes.billing_at || b.attributes.created_at).getTime()
+        invoices.sort(
+          (a, b) =>
+            new Date(
+              a.attributes.billing_at || a.attributes.created_at
+            ).getTime() -
+            new Date(
+              b.attributes.billing_at || b.attributes.created_at
+            ).getTime()
         );
 
         // Process each invoice
@@ -465,86 +473,136 @@ async function importData() {
               id: lsInvoice.id,
               billing_at: lsInvoice.attributes.billing_at,
               subtotal: lsInvoice.attributes.subtotal,
+              discount_total: lsInvoice.attributes.discount_total,
+              tax: lsInvoice.attributes.tax,
               total: lsInvoice.attributes.total,
               status: lsInvoice.attributes.status,
             });
 
-            // Skip refunded or void invoices
-            if (lsInvoice.attributes.status === "refunded" || lsInvoice.attributes.status === "void") {
-              console.log(`Skipping ${lsInvoice.attributes.status} invoice: ${lsInvoice.id}`);
-              continue;
-            }
-
-            // Get the discount redemption for this invoice (if any)
-            const discountRedemption = allLemonSqueezyDiscountRedemptions.find(
-              (d) => d.attributes.order_id === lsInvoice.attributes.order_id
-            );
-
             // Prepare line items for ChartMogul
             const lineItems = [];
 
-            // Calculate amounts
-            const discountAmount = discountRedemption?.attributes?.amount || 0;
+            // Calculate amounts from the subscription invoice
+            // subtotal = price before discount and tax
+            // discount_total = total discount applied
+            // tax = tax amount
+            // total = final amount charged (subtotal - discount + tax)
             const subtotal = lsInvoice.attributes.subtotal || 0;
+            const total = lsInvoice.attributes.total || 0;
+            const discountAmount = lsInvoice.attributes.discount_total || 0;
             const taxAmount = lsInvoice.attributes.tax || 0;
 
             // Calculate service period based on billing date and plan interval
-            const billingDate = new Date(lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at);
+            const billingDate = new Date(
+              lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at
+            );
             let servicePeriodEnd = new Date(billingDate);
 
             const plan_interval = plan.interval_unit || "month";
             const plan_interval_count = plan.interval_count || 1;
 
             if (plan_interval === "year") {
-              servicePeriodEnd.setFullYear(servicePeriodEnd.getFullYear() + plan_interval_count);
+              servicePeriodEnd.setFullYear(
+                servicePeriodEnd.getFullYear() + plan_interval_count
+              );
             } else {
-              servicePeriodEnd.setMonth(servicePeriodEnd.getMonth() + plan_interval_count);
+              servicePeriodEnd.setMonth(
+                servicePeriodEnd.getMonth() + plan_interval_count
+              );
             }
 
-            lineItems.push({
+            // Build line item
+            const lineItem: any = {
               type: "subscription",
               subscription_external_id: subscription.id.toString(),
               plan_uuid: plan.uuid,
-              service_period_start: lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at,
+              service_period_start:
+                lsInvoice.attributes.billing_at ||
+                lsInvoice.attributes.created_at,
               service_period_end: servicePeriodEnd.toISOString(),
-              amount_in_cents: subtotal + taxAmount,
+              amount_in_cents: total,
               quantity: 1,
-              discount_description:
-                discountRedemption?.attributes?.discount_name || undefined,
-              discount_code:
-                discountRedemption?.attributes?.discount_code || undefined,
-              discount_amount_in_cents: discountAmount,
               tax_amount_in_cents: taxAmount,
-            });
+              discount_amount_in_cents:
+                lsInvoice.attributes.discount_total || 0,
+              discount_code: lsInvoice.attributes.discount_code || "",
+              discount_description:
+                lsInvoice.attributes.discount_description || "",
+            };
+
+            // Add discount if present
+            /* if (discountAmount > 0) {
+              lineItem.discount_amount_in_cents = discountAmount;
+              // Try to get discount details from discount redemptions if available
+              const discountRedemption =
+                allLemonSqueezyDiscountRedemptions.find(
+                  (d) => d.attributes.order_id === lsInvoice.attributes.order_id
+                );
+              if (discountRedemption) {
+                lineItem.discount_description =
+                  discountRedemption.attributes.discount_name;
+                lineItem.discount_code =
+                  discountRedemption.attributes.discount_code;
+              }
+            } */
+
+            lineItems.push(lineItem);
 
             // Prepare transactions
             const transactions = [];
+            if (
+              lsInvoice.attributes.status === "refunded"
+              // || lsInvoice.attributes.status === "void"
+            ) {
+              console.log(
+                "Adding refund transaction for invoice:",
+                JSON.stringify(lsInvoice, null, 2)
+              );
+              transactions.push({
+                date:
+                  lsInvoice.attributes.billing_at ||
+                  lsInvoice.attributes.created_at,
+                type: "refund",
+                result: "successful",
+              });
+            }
+
             if (lsInvoice.attributes.status === "paid") {
               transactions.push({
-                date: lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at,
+                date:
+                  lsInvoice.attributes.billing_at ||
+                  lsInvoice.attributes.created_at,
                 type: "payment",
                 result: "successful",
               });
             }
 
+            const invoiceData = {
+              invoices: [
+                {
+                  external_id: `ls-inv-${lsInvoice.id}`,
+                  date:
+                    lsInvoice.attributes.billing_at ||
+                    lsInvoice.attributes.created_at,
+                  currency: lsInvoice.attributes.currency,
+                  due_date:
+                    lsInvoice.attributes.billing_at ||
+                    lsInvoice.attributes.created_at,
+                  customer_external_id: customer.external_id,
+                  data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
+                  line_items: lineItems,
+                  transactions: transactions,
+                },
+              ],
+            };
+
+            console.log("Invoice data:", JSON.stringify(invoiceData, null, 2));
+
             // Import invoice to ChartMogul
             try {
               await chartMogulApi.post(
                 `/import/customers/${customer.uuid}/invoices`,
-                {
-                  invoices: [
-                    {
-                      external_id: `ls-inv-${lsInvoice.id}`,
-                      date: lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at,
-                      currency: lsInvoice.attributes.currency,
-                      due_date: lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at,
-                      customer_external_id: customer.external_id,
-                      data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
-                      line_items: lineItems,
-                      transactions: transactions,
-                    },
-                  ],
-                }
+                invoiceData
               );
               console.log(`Imported subscription invoice: ${lsInvoice.id}`);
             } catch (importError: any) {
