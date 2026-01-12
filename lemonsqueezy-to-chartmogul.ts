@@ -549,30 +549,23 @@ async function importData() {
             lineItems.push(lineItem);
 
             // Prepare transactions
+            // According to ChartMogul docs, refunded invoices should have BOTH payment and refund transactions
             const transactions = [];
-            if (
-              lsInvoice.attributes.status === "refunded"
-              // || lsInvoice.attributes.status === "void"
-            ) {
-              console.log(
-                "Adding refund transaction for invoice:",
-                JSON.stringify(lsInvoice, null, 2)
-              );
+
+            // Add payment transaction for paid or refunded invoices
+            if (lsInvoice.attributes.status === "paid" || lsInvoice.attributes.status === "refunded") {
               transactions.push({
-                date:
-                  lsInvoice.attributes.billing_at ||
-                  lsInvoice.attributes.created_at,
-                type: "refund",
+                date: lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at,
+                type: "payment",
                 result: "successful",
               });
             }
 
-            if (lsInvoice.attributes.status === "paid") {
+            // Add refund transaction if the invoice was refunded
+            if (lsInvoice.attributes.status === "refunded" && lsInvoice.attributes.refunded_at) {
               transactions.push({
-                date:
-                  lsInvoice.attributes.billing_at ||
-                  lsInvoice.attributes.created_at,
-                type: "payment",
+                date: lsInvoice.attributes.refunded_at,
+                type: "refund",
                 result: "successful",
               });
             }
