@@ -4,3 +4,5 @@ node_modules
 .env.local
 output.txt
 dist
+CLAUDE.md
+stories

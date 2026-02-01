@@ -381,6 +381,53 @@ async function importData() {
                 err?.response?.data
               );
             }
+          } else if (subscription.attributes.status === "past_due") {
+            // Issue 3: Past due subscriptions should not contribute to MRR
+            // Skip - if they recover to active, next sync will pick them up
+            console.log(
+              `Skipping past_due subscription (no MRR contribution): ${subscription.id}`
+            );
+          } else if (subscription.attributes.status === "unpaid") {
+            // Issue 3: Unpaid subscriptions are suspended - should not count in MRR
+            // Skip - if they recover to active, next sync will pick them up
+            console.log(
+              `Skipping unpaid subscription (no MRR contribution): ${subscription.id}`
+            );
+          } else if (subscription.attributes.status === "paused") {
+            // Issue 3: Paused subscriptions - don't count in MRR
+            // Skip - if they resume, next sync will pick them up as active
+            console.log(
+              `Skipping paused subscription (no MRR contribution): ${subscription.id}`
+            );
+          } else if (subscription.attributes.status === "on_trial") {
+            // Issue 3: Trial subscriptions - track with $0 MRR
+            try {
+              await chartMogulApi.post("/subscription_events", {
+                subscription_event: {
+                  external_id: `${subscription.id}-trial`,
+                  customer_external_id: customer.external_id,
+                  data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
+                  event_type: "subscription_start_scheduled",
+                  event_date: subscription.attributes.created_at,
+                  effective_date: subscription.attributes.created_at,
+                  subscription_external_id: subscription.id.toString(),
+                  plan_external_id: planExternalId,
+                  currency: order.data.attributes.currency,
+                  amount_in_cents: 0, // $0 MRR during trial
+                  quantity: 1,
+                  event_order: 1,
+                },
+              });
+              console.log(
+                `Created trial subscription event: ${subscription.id}-trial`
+              );
+            } catch (err) {
+              console.error(
+                "Error creating trial subscription event:",
+                // @ts-ignore
+                err?.response?.data
+              );
+            }
           }
         } catch (error: any) {
           console.error(
@@ -455,6 +502,25 @@ async function importData() {
           continue;
         }
 
+        // Get the order to get tax rate information
+        const order = await lemonSqueezyClient.getOrder({
+          id: subscription.attributes.order_id,
+        });
+        const orderAttrs = order?.data?.attributes as any;
+        // tax_rate from Lemon Squeezy is a percentage (e.g., 20), convert to decimal (0.20)
+        const orderTaxRatePercent = orderAttrs?.tax_rate
+          ? parseFloat(orderAttrs.tax_rate)
+          : 0;
+        const orderTaxRate = orderTaxRatePercent / 100;
+        const orderTaxInclusive = orderAttrs?.tax_inclusive ?? false;
+
+        console.log("Order tax info:", {
+          order_id: subscription.attributes.order_id,
+          tax_rate_percent: orderTaxRatePercent,
+          tax_rate_decimal: orderTaxRate,
+          tax_inclusive: orderTaxInclusive,
+        });
+
         // Sort invoices by billing date
         invoices.sort(
           (a, b) =>
@@ -475,6 +541,7 @@ async function importData() {
               subtotal: lsInvoice.attributes.subtotal,
               discount_total: lsInvoice.attributes.discount_total,
               tax: lsInvoice.attributes.tax,
+              tax_inclusive: lsInvoice.attributes.tax_inclusive,
               total: lsInvoice.attributes.total,
               status: lsInvoice.attributes.status,
             });
@@ -483,14 +550,38 @@ async function importData() {
             const lineItems = [];
 
             // Calculate amounts from the subscription invoice
-            // subtotal = price before discount and tax
+            // subtotal = price before discount and tax (but may include tax if tax_inclusive)
             // discount_total = total discount applied
-            // tax = tax amount
-            // total = final amount charged (subtotal - discount + tax)
+            // tax = tax amount (may be 0 if tax is included in subtotal)
+            // total = final amount charged
             const subtotal = lsInvoice.attributes.subtotal || 0;
             const total = lsInvoice.attributes.total || 0;
             const discountAmount = lsInvoice.attributes.discount_total || 0;
-            const taxAmount = lsInvoice.attributes.tax || 0;
+            let taxAmount = lsInvoice.attributes.tax || 0;
+
+            // Handle tax calculation
+            // ChartMogul expects:
+            // - amount_in_cents: GROSS amount (what customer paid, including tax)
+            // - tax_amount_in_cents: tax amount
+            // ChartMogul will subtract tax from amount to calculate net MRR
+            //
+            // Lemon Squeezy data can be inconsistent - sometimes tax_inclusive is false
+            // but the subtotal still includes tax and the tax field is 0.
+            // If tax_rate > 0 and tax = 0, calculate the tax amount from subtotal.
+            let grossAmount = subtotal - discountAmount;
+
+            if (taxAmount === 0 && orderTaxRate > 0) {
+              // Tax field is 0 but there's a tax rate - calculate tax from subtotal
+              // Formula: net = gross / (1 + tax_rate), tax = gross - net
+              const netAmount = Math.round(grossAmount / (1 + orderTaxRate));
+              taxAmount = grossAmount - netAmount;
+              console.log("Calculated tax (subtotal includes VAT):", {
+                grossAmount,
+                taxRatePercent: orderTaxRate * 100,
+                netAmount,
+                taxAmount,
+              });
+            }
 
             // Calculate service period based on billing date and plan interval
             const billingDate = new Date(
@@ -512,6 +603,8 @@ async function importData() {
             }
 
             // Build line item
+            // ChartMogul expects amount_in_cents to be GROSS (including tax)
+            // ChartMogul will subtract tax_amount_in_cents to calculate net MRR
             const lineItem: any = {
               type: "subscription",
               subscription_external_id: subscription.id.toString(),
@@ -520,54 +613,90 @@ async function importData() {
                 lsInvoice.attributes.billing_at ||
                 lsInvoice.attributes.created_at,
               service_period_end: servicePeriodEnd.toISOString(),
-              amount_in_cents: total,
+              amount_in_cents: grossAmount,
               quantity: 1,
               tax_amount_in_cents: taxAmount,
-              discount_amount_in_cents:
-                lsInvoice.attributes.discount_total || 0,
-              discount_code: lsInvoice.attributes.discount_code || "",
-              discount_description:
-                lsInvoice.attributes.discount_description || "",
             };
 
-            // Add discount if present
-            /* if (discountAmount > 0) {
+            // Issue 2 fix: Only add discount fields if there's actually a discount
+            if (discountAmount > 0) {
               lineItem.discount_amount_in_cents = discountAmount;
-              // Try to get discount details from discount redemptions if available
+
+              // Try to find discount details from redemptions by subscription_id or order_id
               const discountRedemption =
                 allLemonSqueezyDiscountRedemptions.find(
-                  (d) => d.attributes.order_id === lsInvoice.attributes.order_id
+                  (d: any) =>
+                    d.attributes.subscription_id ===
+                      lsInvoice.attributes.subscription_id ||
+                    d.attributes.order_id === lsInvoice.attributes.order_id
                 );
+
               if (discountRedemption) {
-                lineItem.discount_description =
-                  discountRedemption.attributes.discount_name;
                 lineItem.discount_code =
-                  discountRedemption.attributes.discount_code;
+                  discountRedemption.attributes.discount_code || "";
+                lineItem.discount_description =
+                  discountRedemption.attributes.discount_name || "";
+              } else {
+                // Fallback to invoice-level discount info if available
+                lineItem.discount_code =
+                  lsInvoice.attributes.discount_code || "";
+                lineItem.discount_description =
+                  lsInvoice.attributes.discount_description || "";
               }
-            } */
+            }
 
             lineItems.push(lineItem);
 
-            // Prepare transactions
-            // According to ChartMogul docs, refunded invoices should have BOTH payment and refund transactions
+            // Issue 3: Prepare transactions based on invoice status
+            // Only import invoices that are paid or refunded
             const transactions = [];
 
-            // Add payment transaction for paid or refunded invoices
-            if (lsInvoice.attributes.status === "paid" || lsInvoice.attributes.status === "refunded") {
+            if (lsInvoice.attributes.status === "paid") {
+              // Paid invoice - add successful payment
               transactions.push({
-                date: lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at,
+                date:
+                  lsInvoice.attributes.billing_at ||
+                  lsInvoice.attributes.created_at,
                 type: "payment",
                 result: "successful",
               });
-            }
-
-            // Add refund transaction if the invoice was refunded
-            if (lsInvoice.attributes.status === "refunded" && lsInvoice.attributes.refunded_at) {
+            } else if (lsInvoice.attributes.status === "refunded") {
+              // Refunded invoice - add both payment and refund transactions
               transactions.push({
-                date: lsInvoice.attributes.refunded_at,
-                type: "refund",
+                date:
+                  lsInvoice.attributes.billing_at ||
+                  lsInvoice.attributes.created_at,
+                type: "payment",
                 result: "successful",
               });
+              if (lsInvoice.attributes.refunded_at) {
+                transactions.push({
+                  date: lsInvoice.attributes.refunded_at,
+                  type: "refund",
+                  result: "successful",
+                });
+              }
+            } else if (
+              lsInvoice.attributes.status === "pending" ||
+              lsInvoice.attributes.status === "past_due"
+            ) {
+              // Pending/past_due invoice - skip entirely
+              console.log(
+                `Skipping unpaid invoice: ${lsInvoice.id} (status: ${lsInvoice.attributes.status})`
+              );
+              continue;
+            } else if (lsInvoice.attributes.status === "void") {
+              // Voided invoice - skip
+              console.log(`Skipping voided invoice: ${lsInvoice.id}`);
+              continue;
+            }
+
+            // Only create invoice if there are transactions
+            if (transactions.length === 0) {
+              console.log(
+                `Skipping invoice with no valid transactions: ${lsInvoice.id} (status: ${lsInvoice.attributes.status})`
+              );
+              continue;
             }
 
             const invoiceData = {
