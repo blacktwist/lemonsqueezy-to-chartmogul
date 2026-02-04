@@ -15,6 +15,17 @@ import {
   getAllLemonSqueezySubscriptionInvoices,
   lemonSqueezyClient,
 } from "./libs/lemonSqueezy.js";
+import {
+  taxRateToDecimal,
+  calculateGrossAmountForChartMogul,
+  calculateServicePeriodEnd,
+  shouldSkipSubscriptionStatus,
+  isTrialSubscription,
+  shouldSkipInvoiceStatus,
+  buildInvoiceTransactions,
+  buildLineItem,
+  getPlanExternalId,
+} from "./libs/sync-utils.js";
 
 const CHARTMOGUL_DATA_SOURCE_UUID = ENV.CHARTMOGUL_DATA_SOURCE_UUID;
 
@@ -290,9 +301,18 @@ async function importData() {
         // Create subscription events for different statuses
         try {
           // Get the plan external ID that was used when creating the plan
-          let planExternalId = subscription.attributes.variant_id
-            ? `${subscription.attributes.product_id}-${subscription.attributes.variant_id}`
-            : subscription.attributes.product_id.toString();
+          const planExternalId = getPlanExternalId(
+            subscription.attributes.product_id,
+            subscription.attributes.variant_id
+          );
+
+          // Skip subscriptions that shouldn't contribute to MRR
+          if (shouldSkipSubscriptionStatus(subscription.attributes.status)) {
+            console.log(
+              `Skipping ${subscription.attributes.status} subscription (no MRR contribution): ${subscription.id}`
+            );
+            continue;
+          }
 
           if (subscription.attributes.status === "active") {
             try {
@@ -381,26 +401,8 @@ async function importData() {
                 err?.response?.data
               );
             }
-          } else if (subscription.attributes.status === "past_due") {
-            // Issue 3: Past due subscriptions should not contribute to MRR
-            // Skip - if they recover to active, next sync will pick them up
-            console.log(
-              `Skipping past_due subscription (no MRR contribution): ${subscription.id}`
-            );
-          } else if (subscription.attributes.status === "unpaid") {
-            // Issue 3: Unpaid subscriptions are suspended - should not count in MRR
-            // Skip - if they recover to active, next sync will pick them up
-            console.log(
-              `Skipping unpaid subscription (no MRR contribution): ${subscription.id}`
-            );
-          } else if (subscription.attributes.status === "paused") {
-            // Issue 3: Paused subscriptions - don't count in MRR
-            // Skip - if they resume, next sync will pick them up as active
-            console.log(
-              `Skipping paused subscription (no MRR contribution): ${subscription.id}`
-            );
-          } else if (subscription.attributes.status === "on_trial") {
-            // Issue 3: Trial subscriptions - track with $0 MRR
+          } else if (isTrialSubscription(subscription.attributes.status)) {
+            // Trial subscriptions - track with $0 MRR
             try {
               await chartMogulApi.post("/subscription_events", {
                 subscription_event: {
@@ -488,9 +490,10 @@ async function importData() {
         }
 
         // Get plan UUID from ChartMogul
-        let planExternalId = subscription.attributes.variant_id
-          ? `${subscription.attributes.product_id}-${subscription.attributes.variant_id}`
-          : subscription.attributes.product_id.toString();
+        const planExternalId = getPlanExternalId(
+          subscription.attributes.product_id,
+          subscription.attributes.variant_id
+        );
 
         // Search for the plan in ChartMogul
         const plan = existingChartMogulPlans.find(
@@ -511,14 +514,12 @@ async function importData() {
         const orderTaxRatePercent = orderAttrs?.tax_rate
           ? parseFloat(orderAttrs.tax_rate)
           : 0;
-        const orderTaxRate = orderTaxRatePercent / 100;
-        const orderTaxInclusive = orderAttrs?.tax_inclusive ?? false;
+        const orderTaxRate = taxRateToDecimal(orderTaxRatePercent);
 
         console.log("Order tax info:", {
           order_id: subscription.attributes.order_id,
           tax_rate_percent: orderTaxRatePercent,
           tax_rate_decimal: orderTaxRate,
-          tax_inclusive: orderTaxInclusive,
         });
 
         // Sort invoices by billing date
@@ -559,137 +560,104 @@ async function importData() {
             const discountAmount = lsInvoice.attributes.discount_total || 0;
             let taxAmount = lsInvoice.attributes.tax || 0;
 
-            // Handle tax calculation
-            // ChartMogul expects:
-            // - amount_in_cents: GROSS amount (what customer paid, including tax)
-            // - tax_amount_in_cents: tax amount
-            // ChartMogul will subtract tax from amount to calculate net MRR
-            //
-            // Lemon Squeezy data can be inconsistent - sometimes tax_inclusive is false
-            // but the subtotal still includes tax and the tax field is 0.
-            // If tax_rate > 0 and tax = 0, calculate the tax amount from subtotal.
-            let grossAmount = subtotal - discountAmount;
+            // Calculate gross amount and tax for ChartMogul
+            const taxInclusive = lsInvoice.attributes.tax_inclusive ?? true;
+            const grossAmountResult = calculateGrossAmountForChartMogul(
+              subtotal,
+              total,
+              discountAmount,
+              taxAmount,
+              orderTaxRate,
+              taxInclusive
+            );
 
-            if (taxAmount === 0 && orderTaxRate > 0) {
-              // Tax field is 0 but there's a tax rate - calculate tax from subtotal
-              // Formula: net = gross / (1 + tax_rate), tax = gross - net
-              const netAmount = Math.round(grossAmount / (1 + orderTaxRate));
-              taxAmount = grossAmount - netAmount;
-              console.log("Calculated tax (subtotal includes VAT):", {
-                grossAmount,
-                taxRatePercent: orderTaxRate * 100,
-                netAmount,
-                taxAmount,
-              });
-            }
+            const grossAmount = grossAmountResult.grossAmount;
+            taxAmount = grossAmountResult.taxAmount;
+
+            console.log("Calculated gross amount for ChartMogul:", {
+              subtotal,
+              total,
+              discountAmount,
+              taxInclusive,
+              orderTaxRate,
+              grossAmount,
+              taxAmount,
+              netMRR: grossAmount - taxAmount,
+            });
 
             // Calculate service period based on billing date and plan interval
             const billingDate = new Date(
               lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at
             );
-            let servicePeriodEnd = new Date(billingDate);
+            const planInterval = (plan.interval_unit || "month") as
+              | "month"
+              | "year";
+            const planIntervalCount = plan.interval_count || 1;
+            const servicePeriodEnd = calculateServicePeriodEnd(
+              billingDate,
+              planInterval,
+              planIntervalCount
+            );
 
-            const plan_interval = plan.interval_unit || "month";
-            const plan_interval_count = plan.interval_count || 1;
+            // Build line item - find discount details if applicable
+            let discountCode: string | undefined;
+            let discountDescription: string | undefined;
 
-            if (plan_interval === "year") {
-              servicePeriodEnd.setFullYear(
-                servicePeriodEnd.getFullYear() + plan_interval_count
-              );
-            } else {
-              servicePeriodEnd.setMonth(
-                servicePeriodEnd.getMonth() + plan_interval_count
-              );
-            }
-
-            // Build line item
-            // ChartMogul expects amount_in_cents to be GROSS (including tax)
-            // ChartMogul will subtract tax_amount_in_cents to calculate net MRR
-            const lineItem: any = {
-              type: "subscription",
-              subscription_external_id: subscription.id.toString(),
-              plan_uuid: plan.uuid,
-              service_period_start:
-                lsInvoice.attributes.billing_at ||
-                lsInvoice.attributes.created_at,
-              service_period_end: servicePeriodEnd.toISOString(),
-              amount_in_cents: grossAmount,
-              quantity: 1,
-              tax_amount_in_cents: taxAmount,
-            };
-
-            // Issue 2 fix: Only add discount fields if there's actually a discount
             if (discountAmount > 0) {
-              lineItem.discount_amount_in_cents = discountAmount;
-
-              // Try to find discount details from redemptions by subscription_id or order_id
+              // Try to find discount details from redemptions
+              // Redemptions are linked to orders, not subscriptions or invoices
+              // We need to lookup via subscription.order_id
               const discountRedemption =
                 allLemonSqueezyDiscountRedemptions.find(
                   (d: any) =>
-                    d.attributes.subscription_id ===
-                      lsInvoice.attributes.subscription_id ||
-                    d.attributes.order_id === lsInvoice.attributes.order_id
+                    d.attributes.order_id === subscription.attributes.order_id
                 );
 
               if (discountRedemption) {
-                lineItem.discount_code =
-                  discountRedemption.attributes.discount_code || "";
-                lineItem.discount_description =
-                  discountRedemption.attributes.discount_name || "";
+                discountCode =
+                  discountRedemption.attributes.discount_code || undefined;
+                discountDescription =
+                  discountRedemption.attributes.discount_name || undefined;
               } else {
-                // Fallback to invoice-level discount info if available
-                lineItem.discount_code =
-                  lsInvoice.attributes.discount_code || "";
-                lineItem.discount_description =
-                  lsInvoice.attributes.discount_description || "";
+                // Fallback to invoice-level discount info
+                discountCode =
+                  lsInvoice.attributes.discount_code || undefined;
+                discountDescription =
+                  lsInvoice.attributes.discount_description || undefined;
               }
             }
+
+            const servicePeriodStart =
+              lsInvoice.attributes.billing_at || lsInvoice.attributes.created_at;
+
+            const lineItem = buildLineItem({
+              subscriptionId: subscription.id.toString(),
+              planUuid: plan.uuid,
+              servicePeriodStart,
+              servicePeriodEnd: servicePeriodEnd.toISOString(),
+              grossAmount,
+              taxAmount,
+              discountAmount,
+              discountCode,
+              discountDescription,
+            });
 
             lineItems.push(lineItem);
 
-            // Issue 3: Prepare transactions based on invoice status
-            // Only import invoices that are paid or refunded
-            const transactions = [];
-
-            if (lsInvoice.attributes.status === "paid") {
-              // Paid invoice - add successful payment
-              transactions.push({
-                date:
-                  lsInvoice.attributes.billing_at ||
-                  lsInvoice.attributes.created_at,
-                type: "payment",
-                result: "successful",
-              });
-            } else if (lsInvoice.attributes.status === "refunded") {
-              // Refunded invoice - add both payment and refund transactions
-              transactions.push({
-                date:
-                  lsInvoice.attributes.billing_at ||
-                  lsInvoice.attributes.created_at,
-                type: "payment",
-                result: "successful",
-              });
-              if (lsInvoice.attributes.refunded_at) {
-                transactions.push({
-                  date: lsInvoice.attributes.refunded_at,
-                  type: "refund",
-                  result: "successful",
-                });
-              }
-            } else if (
-              lsInvoice.attributes.status === "pending" ||
-              lsInvoice.attributes.status === "past_due"
-            ) {
-              // Pending/past_due invoice - skip entirely
+            // Check if invoice should be skipped based on status
+            if (shouldSkipInvoiceStatus(lsInvoice.attributes.status)) {
               console.log(
-                `Skipping unpaid invoice: ${lsInvoice.id} (status: ${lsInvoice.attributes.status})`
+                `Skipping invoice: ${lsInvoice.id} (status: ${lsInvoice.attributes.status})`
               );
               continue;
-            } else if (lsInvoice.attributes.status === "void") {
-              // Voided invoice - skip
-              console.log(`Skipping voided invoice: ${lsInvoice.id}`);
-              continue;
             }
+
+            // Build transactions based on invoice status
+            const transactions = buildInvoiceTransactions(
+              lsInvoice.attributes.status,
+              servicePeriodStart,
+              lsInvoice.attributes.refunded_at
+            );
 
             // Only create invoice if there are transactions
             if (transactions.length === 0) {
