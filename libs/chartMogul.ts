@@ -147,6 +147,36 @@ export const getAllChartMogulInvoices = async () => {
   return allInvoices;
 };
 
+// ChartMogul customer/plan deletion is asynchronous on their end: a DELETE
+// call can return success before the record actually drops out of the list
+// endpoints. Re-fetching immediately after the delete loop can therefore
+// still return records we just "deleted", which previously caused the
+// importer to treat them as existing (and update instead of re-create them,
+// which then failed since they really were gone by that point). Poll the
+// list endpoint until it's actually empty before moving on.
+const VERIFY_DELETE_MAX_ATTEMPTS = 10;
+const VERIFY_DELETE_DELAY_MS = 3000;
+
+const waitUntilEmpty = async (
+  fetchAll: () => Promise<any[]>,
+  label: string
+) => {
+  for (let attempt = 1; attempt <= VERIFY_DELETE_MAX_ATTEMPTS; attempt++) {
+    const remaining = await fetchAll();
+    if (remaining.length === 0) {
+      console.log(`Confirmed all ${label} are gone.`);
+      return;
+    }
+    console.log(
+      `${remaining.length} ${label} still visible after deletion (attempt ${attempt}/${VERIFY_DELETE_MAX_ATTEMPTS}), waiting for ChartMogul to catch up...`
+    );
+    await new Promise((resolve) => setTimeout(resolve, VERIFY_DELETE_DELAY_MS));
+  }
+  console.error(
+    `Gave up waiting for ${label} to fully clear after ${VERIFY_DELETE_MAX_ATTEMPTS} attempts; proceeding anyway - some stale records may remain.`
+  );
+};
+
 export const deleteAllChartMogulData = async () => {
   console.log("Starting deletion of all ChartMogul data...");
 
@@ -169,6 +199,11 @@ export const deleteAllChartMogulData = async () => {
       }
     }
 
+    // Don't proceed until the customers we just deleted have actually
+    // dropped out of ChartMogul's index - otherwise the caller's next
+    // customer list fetch can still contain them.
+    await waitUntilEmpty(getAllChartMogulCustomers, "customers");
+
     // 2. Delete all plans (now that invoices are gone via customer deletion)
     console.log("Deleting all plans...");
     const plans = await getAllChartMogulPlans();
@@ -186,6 +221,8 @@ export const deleteAllChartMogulData = async () => {
         );
       }
     }
+
+    await waitUntilEmpty(getAllChartMogulPlans, "plans");
 
     console.log("All ChartMogul data deleted successfully!");
   } catch (error: any) {
