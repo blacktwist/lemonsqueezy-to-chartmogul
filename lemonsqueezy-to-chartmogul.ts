@@ -29,6 +29,38 @@ import {
 
 const CHARTMOGUL_DATA_SOURCE_UUID = ENV.CHARTMOGUL_DATA_SOURCE_UUID;
 
+async function createChartMogulCustomer(customer: any) {
+  await chartMogulApi.post("/customers", {
+    external_id: customer.id.toString(),
+    data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
+    company: customer.attributes.name || customer.attributes.email,
+    country: customer.attributes.country,
+    state: customer.attributes.region,
+    city: customer.attributes.city,
+    lead_created_at: customer.attributes.created_at,
+    email: customer.attributes.email,
+    primary_contact: {
+      first_name: customer.attributes.name?.split(" ")[0] || "",
+      last_name:
+        customer.attributes.name?.split(" ").slice(1).join(" ") || "",
+      email: customer.attributes.email,
+    },
+  });
+}
+
+// ChartMogul customer deletion can lag behind its own list endpoint (see
+// waitUntilEmpty in libs/chartMogul.ts). If a customer we think exists
+// vanishes out from under an update, it means the delete finally landed
+// between our list fetch and this call - re-create it instead of losing it.
+function isCustomerMissingError(error: any): boolean {
+  const errors = error?.response?.data?.errors;
+  return (
+    error?.response?.status === 404 ||
+    (typeof errors?.customer_id === "string" &&
+      errors.customer_id.includes("does not exist"))
+  );
+}
+
 async function importData() {
   try {
     // Delete all existing data from ChartMogul first
@@ -96,11 +128,29 @@ async function importData() {
             });
             console.log(`Updated customer: ${customer.attributes.email}`);
           } catch (error) {
-            console.error(
-              "Error updating customer:",
-              // @ts-ignore
-              error?.response?.data
-            );
+            if (isCustomerMissingError(error)) {
+              console.warn(
+                `Customer ${customer.attributes.email} no longer exists on ChartMogul (deletion race) - creating it instead.`
+              );
+              try {
+                await createChartMogulCustomer(customer);
+                console.log(
+                  `Created customer (after failed update): ${customer.attributes.email}`
+                );
+              } catch (createError) {
+                console.error(
+                  "Error creating customer after failed update:",
+                  // @ts-ignore
+                  createError?.response?.data
+                );
+              }
+            } else {
+              console.error(
+                "Error updating customer:",
+                // @ts-ignore
+                error?.response?.data
+              );
+            }
           }
         } else {
           try {
@@ -110,22 +160,7 @@ async function importData() {
               email: customer.attributes.email,
               external_id: customer.id.toString(),
             });
-            await chartMogulApi.post("/customers", {
-              external_id: customer.id.toString(),
-              data_source_uuid: CHARTMOGUL_DATA_SOURCE_UUID,
-              company: customer.attributes.name || customer.attributes.email,
-              country: customer.attributes.country,
-              state: customer.attributes.region,
-              city: customer.attributes.city,
-              lead_created_at: customer.attributes.created_at,
-              email: customer.attributes.email,
-              primary_contact: {
-                first_name: customer.attributes.name?.split(" ")[0] || "",
-                last_name:
-                  customer.attributes.name?.split(" ").slice(1).join(" ") || "",
-                email: customer.attributes.email,
-              },
-            });
+            await createChartMogulCustomer(customer);
             console.log(`Created customer: ${customer.attributes.email}`);
           } catch (error) {
             console.error(
