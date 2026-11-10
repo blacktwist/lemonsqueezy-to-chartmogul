@@ -186,6 +186,46 @@ export function shouldSkipSubscriptionStatus(status: string): boolean {
 }
 
 /**
+ * Lemon Squeezy statuses that must not carry MRR in ChartMogul.
+ * Lemon Squeezy's own MRR counts only `active` subscriptions (`cancelled`
+ * ones are handled by the existing cancellation event). These statuses still
+ * have paid invoices imported, and ChartMogul keeps an invoice-based
+ * subscription active until it is explicitly cancelled, so we must cancel them.
+ */
+const CANCEL_IN_CHARTMOGUL_STATUSES = [
+  "past_due",
+  "unpaid",
+  "suspended",
+  "paused",
+  "expired",
+];
+
+export function shouldCancelInChartMogul(status: string): boolean {
+  return CANCEL_IN_CHARTMOGUL_STATUSES.includes(status);
+}
+
+/**
+ * Pick the date a non-active subscription should stop contributing MRR.
+ * - expired: Lemon Squeezy's ends_at (falls back to updated_at)
+ * - others: end of the last paid service period (falls back to updated_at)
+ * Never in the future, so MRR drops as soon as Lemon Squeezy stops counting it.
+ */
+export function getCancellationDate(params: {
+  status: string;
+  lastPaidPeriodEnd: Date | undefined;
+  endsAt: string | null | undefined;
+  updatedAt: string;
+  now: Date;
+}): string {
+  const { status, lastPaidPeriodEnd, endsAt, updatedAt, now } = params;
+  const candidate =
+    status === "expired"
+      ? new Date(endsAt || updatedAt)
+      : lastPaidPeriodEnd ?? new Date(updatedAt);
+  return (candidate > now ? now : candidate).toISOString();
+}
+
+/**
  * Determine if a subscription is a trial (should have $0 MRR).
  *
  * @param status - The subscription status

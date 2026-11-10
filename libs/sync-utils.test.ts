@@ -10,6 +10,8 @@ import {
   buildInvoiceTransactions,
   buildLineItem,
   getPlanExternalId,
+  shouldCancelInChartMogul,
+  getCancellationDate,
 } from "./sync-utils.js";
 
 describe("calculateTaxFromGross", () => {
@@ -449,5 +451,85 @@ describe("getPlanExternalId", () => {
 
   it("should handle mixed types", () => {
     expect(getPlanExternalId(123, "456")).toBe("123-456");
+  });
+});
+
+describe("shouldCancelInChartMogul", () => {
+  it.each(["past_due", "unpaid", "suspended", "paused", "expired"])(
+    "cancels %s subscriptions (Lemon Squeezy excludes them from MRR)",
+    (status) => {
+      expect(shouldCancelInChartMogul(status)).toBe(true);
+    }
+  );
+
+  it.each(["active", "on_trial", "cancelled"])(
+    "does not cancel %s subscriptions",
+    (status) => {
+      expect(shouldCancelInChartMogul(status)).toBe(false);
+    }
+  );
+});
+
+describe("getCancellationDate", () => {
+  const now = new Date("2026-11-10T08:00:00Z");
+
+  it("uses the end of the last paid service period for unpaid/past_due/suspended", () => {
+    expect(
+      getCancellationDate({
+        status: "unpaid",
+        lastPaidPeriodEnd: new Date("2026-10-04T00:00:00Z"),
+        endsAt: null,
+        updatedAt: "2026-10-20T00:00:00Z",
+        now,
+      })
+    ).toBe("2026-10-04T00:00:00.000Z");
+  });
+
+  it("caps a future service period end at now, so MRR drops immediately like in Lemon Squeezy", () => {
+    expect(
+      getCancellationDate({
+        status: "past_due",
+        lastPaidPeriodEnd: new Date("2026-12-01T00:00:00Z"),
+        endsAt: null,
+        updatedAt: "2026-11-01T00:00:00Z",
+        now,
+      })
+    ).toBe(now.toISOString());
+  });
+
+  it("falls back to updated_at when there is no paid invoice", () => {
+    expect(
+      getCancellationDate({
+        status: "suspended",
+        lastPaidPeriodEnd: undefined,
+        endsAt: null,
+        updatedAt: "2025-03-11T00:00:00Z",
+        now,
+      })
+    ).toBe("2025-03-11T00:00:00.000Z");
+  });
+
+  it("uses ends_at for expired subscriptions", () => {
+    expect(
+      getCancellationDate({
+        status: "expired",
+        lastPaidPeriodEnd: new Date("2027-05-31T00:00:00Z"),
+        endsAt: "2026-05-31T00:00:00Z",
+        updatedAt: "2026-06-01T00:00:00Z",
+        now,
+      })
+    ).toBe("2026-05-31T00:00:00.000Z");
+  });
+
+  it("falls back to updated_at for expired subscriptions without ends_at", () => {
+    expect(
+      getCancellationDate({
+        status: "expired",
+        lastPaidPeriodEnd: undefined,
+        endsAt: null,
+        updatedAt: "2026-06-01T00:00:00Z",
+        now,
+      })
+    ).toBe("2026-06-01T00:00:00.000Z");
   });
 });
