@@ -25,6 +25,8 @@ import {
   buildInvoiceTransactions,
   buildLineItem,
   getPlanExternalId,
+  shouldCancelInChartMogul,
+  getCancellationDate,
 } from "./libs/sync-utils.js";
 
 const CHARTMOGUL_DATA_SOURCE_UUID = ENV.CHARTMOGUL_DATA_SOURCE_UUID;
@@ -486,6 +488,9 @@ async function importData() {
       `Found ${allSubscriptionInvoices.length} subscription invoices in LemonSqueezy`
     );
 
+    // End of the latest paid service period per subscription, used in step 5
+    const lastPaidPeriodEndBySubscription = new Map<string, Date>();
+
     // Group invoices by subscription
     const invoicesBySubscription = new Map<string, any[]>();
     for (const invoice of allSubscriptionInvoices) {
@@ -730,6 +735,15 @@ async function importData() {
                 invoiceData
               );
               console.log(`Imported subscription invoice: ${lsInvoice.id}`);
+              if (lsInvoice.attributes.status === "paid") {
+                const prev = lastPaidPeriodEndBySubscription.get(subscriptionId);
+                if (!prev || servicePeriodEnd > prev) {
+                  lastPaidPeriodEndBySubscription.set(
+                    subscriptionId,
+                    servicePeriodEnd
+                  );
+                }
+              }
             } catch (importError: any) {
               console.error(
                 "Error importing subscription invoice:",
@@ -753,11 +767,109 @@ async function importData() {
       }
     }
     console.log("Subscription invoices exported and imported successfully!");
+
+    // 5. Cancel subscriptions that Lemon Squeezy doesn't count in MRR
+    // (past_due, unpaid, suspended, paused, expired). Their paid invoices
+    // were imported above, and ChartMogul keeps an invoice-based subscription
+    // active until it is explicitly cancelled.
+    await cancelNonActiveSubscriptions(
+      subscriptions,
+      lastPaidPeriodEndBySubscription
+    );
+
     console.log("Data export and import completed successfully!");
   } catch (error) {
     console.error("Error during data export and import:", error);
     throw error;
   }
+}
+
+async function cancelNonActiveSubscriptions(
+  subscriptions: any[],
+  lastPaidPeriodEndBySubscription: Map<string, Date>
+) {
+  console.log("Cancelling non-active subscriptions in ChartMogul...");
+  const toCancel = subscriptions.filter((s) =>
+    shouldCancelInChartMogul(s.attributes.status)
+  );
+  if (toCancel.length === 0) return;
+
+  // Re-fetch so customers created during this run have their UUIDs
+  const customers = await getAllChartMogulCustomers();
+  const now = new Date();
+  let cancelled = 0;
+
+  // Group by customer so each customer's subscriptions are listed once
+  const byEmail = new Map<string, any[]>();
+  for (const s of toCancel) {
+    const email = s.attributes.user_email;
+    if (!byEmail.has(email)) byEmail.set(email, []);
+    byEmail.get(email)!.push(s);
+  }
+
+  for (const [email, lsSubs] of byEmail) {
+    const customer = customers.find((c) => c.email === email);
+    if (!customer) continue;
+
+    try {
+      const cmSubs: any[] = [];
+      let cursor: string | undefined;
+      do {
+        const res = await chartMogulApi.get(
+          `/import/customers/${customer.uuid}/subscriptions`,
+          { params: { per_page: 200, ...(cursor ? { cursor } : {}) } }
+        );
+        cmSubs.push(...(res.data.subscriptions || []));
+        cursor = res.data.has_more ? res.data.cursor : undefined;
+      } while (cursor);
+
+      for (const lsSub of lsSubs) {
+        const subscriptionId = lsSub.id.toString();
+        const cmSub = cmSubs.find((s) => s.external_id === subscriptionId);
+        if (!cmSub) {
+          // Expected when no paid invoice was imported; otherwise suspicious
+          if (lastPaidPeriodEndBySubscription.has(subscriptionId)) {
+            console.warn(
+              `Subscription ${subscriptionId} has paid invoices but no ChartMogul subscription to cancel`
+            );
+          }
+          continue;
+        }
+        // Already cancelled by its subscription_cancelled event
+        if (cmSub.cancellation_dates?.length) continue;
+
+        const cancellationDate = getCancellationDate({
+          status: lsSub.attributes.status,
+          lastPaidPeriodEnd: lastPaidPeriodEndBySubscription.get(subscriptionId),
+          endsAt: lsSub.attributes.ends_at,
+          updatedAt: lsSub.attributes.updated_at,
+          now,
+        });
+
+        try {
+          await chartMogulApi.patch(`/import/subscriptions/${cmSub.uuid}`, {
+            cancellation_dates: [cancellationDate],
+          });
+          cancelled++;
+          console.log(
+            `Cancelled ${lsSub.attributes.status} subscription ${subscriptionId} at ${cancellationDate}`
+          );
+        } catch (error: any) {
+          console.error(
+            `Error cancelling subscription ${subscriptionId}:`,
+            error?.response?.data || error
+          );
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    } catch (error: any) {
+      console.error(
+        `Error listing ChartMogul subscriptions for ${email}:`,
+        error?.response?.data || error
+      );
+    }
+  }
+  console.log(`Cancelled ${cancelled} non-active subscription(s) in ChartMogul`);
 }
 
 (async () => {
