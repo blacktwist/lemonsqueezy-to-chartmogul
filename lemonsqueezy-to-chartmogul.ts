@@ -756,6 +756,7 @@ async function importData() {
     console.log("Data export and import completed successfully!");
   } catch (error) {
     console.error("Error during data export and import:", error);
+    throw error;
   }
 }
 

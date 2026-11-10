@@ -147,15 +147,10 @@ export const getAllChartMogulInvoices = async () => {
   return allInvoices;
 };
 
-// ChartMogul customer/plan deletion is asynchronous on their end: a DELETE
-// call can return success before the record actually drops out of the list
-// endpoints. Re-fetching immediately after the delete loop can therefore
-// still return records we just "deleted", which previously caused the
-// importer to treat them as existing (and update instead of re-create them,
-// which then failed since they really were gone by that point). Poll the
-// list endpoint until it's actually empty before moving on.
 const VERIFY_DELETE_MAX_ATTEMPTS = 10;
 const VERIFY_DELETE_DELAY_MS = 3000;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const waitUntilEmpty = async (
   fetchAll: () => Promise<any[]>,
@@ -170,57 +165,76 @@ const waitUntilEmpty = async (
     console.log(
       `${remaining.length} ${label} still visible after deletion (attempt ${attempt}/${VERIFY_DELETE_MAX_ATTEMPTS}), waiting for ChartMogul to catch up...`
     );
-    await new Promise((resolve) => setTimeout(resolve, VERIFY_DELETE_DELAY_MS));
+    await sleep(VERIFY_DELETE_DELAY_MS);
   }
-  console.error(
-    `Gave up waiting for ${label} to fully clear after ${VERIFY_DELETE_MAX_ATTEMPTS} attempts; proceeding anyway - some stale records may remain.`
+  throw new Error(
+    `${label} still present in ChartMogul after ${VERIFY_DELETE_MAX_ATTEMPTS} checks; aborting sync to avoid importing on top of stale data.`
   );
+};
+
+const DELETE_MAX_RETRIES = 4;
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
+
+const deleteWithRetry = async (path: string) => {
+  for (let retry = 0; ; retry++) {
+    try {
+      await chartMogulApi.delete(path);
+      return;
+    } catch (error: any) {
+      const status = error?.response?.status;
+      if (status === 404) return;
+      const retryable = !error?.response || RETRYABLE_STATUSES.has(status);
+      if (!retryable || retry >= DELETE_MAX_RETRIES) throw error;
+      const retryAfterSeconds = Number(error.response?.headers?.["retry-after"]);
+      const delayMs =
+        retryAfterSeconds > 0 ? retryAfterSeconds * 1000 : 1000 * 2 ** retry;
+      console.warn(
+        `DELETE ${path} failed (${status ?? error.code}), retrying in ${delayMs}ms (retry ${retry + 1}/${DELETE_MAX_RETRIES})...`
+      );
+      await sleep(delayMs);
+    }
+  }
+};
+
+const deleteAll = async (
+  records: any[],
+  label: string,
+  pathFor: (record: any) => string
+) => {
+  const failures: { uuid: string; error: any }[] = [];
+
+  for (const record of records) {
+    try {
+      await deleteWithRetry(pathFor(record));
+      console.log(`Deleted ${label}: ${record.uuid}`);
+    } catch (error: any) {
+      const details = error?.response?.data || error?.message || error;
+      console.error(`Error deleting ${label} ${record.uuid}:`, details);
+      failures.push({ uuid: record.uuid, error: details });
+    }
+    await sleep(100);
+  }
+
+  if (failures.length > 0) {
+    throw new Error(
+      `Failed to delete ${failures.length}/${records.length} ${label}(s); aborting sync. First error: ${JSON.stringify(failures[0].error)}`
+    );
+  }
 };
 
 export const deleteAllChartMogulData = async () => {
   console.log("Starting deletion of all ChartMogul data...");
 
   try {
-    // 1. Delete all customers (this will cascade delete their invoices)
     console.log("Deleting all customers (including their invoices)...");
     const customers = await getAllChartMogulCustomers();
+    await deleteAll(customers, "customer", (c) => `/customers/${c.uuid}`);
 
-    for (const customer of customers) {
-      try {
-        await chartMogulApi.delete(`/customers/${customer.uuid}`);
-        console.log(`Deleted customer (and their invoices): ${customer.uuid}`);
-        // Add a small delay to avoid rate limiting
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      } catch (error: any) {
-        console.error(
-          `Error deleting customer ${customer.uuid}:`,
-          error?.response?.data || error
-        );
-      }
-    }
-
-    // Don't proceed until the customers we just deleted have actually
-    // dropped out of ChartMogul's index - otherwise the caller's next
-    // customer list fetch can still contain them.
     await waitUntilEmpty(getAllChartMogulCustomers, "customers");
 
-    // 2. Delete all plans (now that invoices are gone via customer deletion)
     console.log("Deleting all plans...");
     const plans = await getAllChartMogulPlans();
-
-    for (const plan of plans) {
-      try {
-        await chartMogulApi.delete(`/plans/${plan.uuid}`);
-        console.log(`Deleted plan: ${plan.uuid}`);
-        // Add a small delay to avoid rate limiting
-        await new Promise((resolve) => setTimeout(resolve, 100));
-      } catch (error: any) {
-        console.error(
-          `Error deleting plan ${plan.uuid}:`,
-          error?.response?.data || error
-        );
-      }
-    }
+    await deleteAll(plans, "plan", (p) => `/plans/${p.uuid}`);
 
     await waitUntilEmpty(getAllChartMogulPlans, "plans");
 
